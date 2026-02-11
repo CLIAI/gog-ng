@@ -12,8 +12,9 @@ build/
 # SQLite databases
 *.sqlite3
 
-# Claude Code backups
+# Claude Code backups and local settings
 .claude/*.bak.*
+.claude/settings.local.json
 
 # Temporary files
 tmp/
