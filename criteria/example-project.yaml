@@ -1,0 +1,31 @@
+# Example: Track communications for a project
+#
+# Customize this template for your use case:
+# - Set the group name to your project/organization
+# - Add relevant email addresses and domains
+# - Adjust the time window (newer_than)
+#
+# Usage: gog-ng sync --criteria example-project
+
+group: "my-project"
+topic: "default"
+description: "Communications related to my-project"
+
+clients:
+  - default
+
+include:
+  addresses:
+    - "teammate@example.com"
+  domains:
+    - "@example.com"
+  subjects:
+    - "project update"
+    - "meeting notes"
+
+exclude:
+  addresses:
+    - "noreply@example.com"
+
+newer_than: "90d"
+max_results: 100

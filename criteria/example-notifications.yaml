@@ -1,0 +1,27 @@
+# Example: Aggregate notifications from a service
+#
+# Customize for tracking automated notifications:
+# - GitHub, GitLab, Jira notifications
+# - CI/CD alerts
+# - Monitoring alerts
+#
+# Usage: gog-ng sync --criteria example-notifications
+
+group: "github-notifications"
+topic: "default"
+description: "GitHub notification emails"
+
+clients:
+  - default
+
+include:
+  domains:
+    - "@github.com"
+  addresses:
+    - "notifications@github.com"
+
+# Skip global exclusions since notifications@ is in the global exclude list
+skip_global_exclusions: true
+
+newer_than: "30d"
+max_results: 200

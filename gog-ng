@@ -1,0 +1,1139 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "ruamel.yaml>=0.18",
+#     "python-frontmatter>=1.1.0",
+#     "sqlite-utils>=3.36",
+#     "click>=8.1",
+#     "markdownify>=0.13",
+# ]
+# ///
+"""
+gog-ng - Enhanced gog CLI Wrapper
+
+Wraps `gog` CLI to provide local caching, criteria-based search,
+and structured output for Gmail (and future Google services).
+
+Architecture:
+- YAML files are authoritative (machine-readable, full fidelity)
+- Markdown files are derived (human/LLM-readable)
+- Single-client caches are source of truth
+- Merge views are computed from single-client data
+- SQLite index is ephemeral (rebuilt from YAML)
+
+See README.md for full documentation.
+See docs/DESIGN_DECISIONS.md for rationale.
+"""
+
+import base64
+import hashlib
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from datetime import datetime, timezone
+from io import StringIO
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+
+import click
+import frontmatter
+import markdownify
+import sqlite_utils
+from ruamel.yaml import YAML
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+SCRIPT_DIR = Path(__file__).parent
+DEFAULT_CACHE_DIR = SCRIPT_DIR / "cache"
+DEFAULT_DB_PATH = Path("/tmp/gog-ng/index.sqlite3")
+DEFAULT_CRITERIA_DIR = SCRIPT_DIR / "criteria"
+
+CACHE_DIR = Path(os.environ.get("GOG_NG_CACHE_DIR", DEFAULT_CACHE_DIR))
+DB_PATH = Path(os.environ.get("GOG_NG_DB_PATH", DEFAULT_DB_PATH))
+CRITERIA_DIR = Path(os.environ.get("GOG_NG_CRITERIA_DIR", DEFAULT_CRITERIA_DIR))
+
+# Timezone for display - configurable via environment
+_tz_name = os.environ.get("GOG_NG_TIMEZONE", "UTC")
+try:
+    LOCAL_TZ = ZoneInfo(_tz_name)
+except KeyError:
+    click.echo(f"[warn] Unknown timezone '{_tz_name}', falling back to UTC", err=True)
+    LOCAL_TZ = ZoneInfo("UTC")
+
+
+# ============================================================================
+# YAML Helpers (deterministic output)
+# ============================================================================
+
+def get_yaml() -> YAML:
+    """Get configured YAML instance for deterministic output."""
+    yaml = YAML()
+    yaml.default_flow_style = False
+    yaml.width = 4096  # Prevent line wrapping
+    # sequence=4 ensures list item contents are properly indented
+    yaml.indent(mapping=2, sequence=4, offset=2)
+    yaml.preserve_quotes = True
+    return yaml
+
+
+def yaml_dumps(data: dict) -> str:
+    """Dump dict to YAML string."""
+    yaml = get_yaml()
+    stream = StringIO()
+    yaml.dump(data, stream)
+    return stream.getvalue()
+
+
+def yaml_load(path: Path) -> dict:
+    """Load YAML file."""
+    yaml = get_yaml()
+    with open(path) as f:
+        return yaml.load(f) or {}
+
+
+def sorted_dict(d: dict) -> dict:
+    """Recursively sort dictionary keys for deterministic output."""
+    result = {}
+    for k in sorted(d.keys()):
+        v = d[k]
+        if isinstance(v, dict):
+            result[k] = sorted_dict(v)
+        elif isinstance(v, list):
+            result[k] = [sorted_dict(i) if isinstance(i, dict) else i for i in v]
+        else:
+            result[k] = v
+    return result
+
+
+# ============================================================================
+# Timezone Helpers
+# ============================================================================
+
+def get_timezone_abbrev(dt: datetime) -> str:
+    """Get timezone abbreviation for datetime."""
+    if dt.tzinfo is None:
+        return "UTC"
+    local_dt = dt.astimezone(LOCAL_TZ)
+    return local_dt.strftime("%Z")
+
+
+def format_datetime_with_tz(dt_str: str) -> tuple[str, str]:
+    """
+    Parse datetime string and return (formatted_str, timezone_abbrev).
+
+    Input: "2025-01-15 10:00" or ISO format
+    Output: ("2025-01-15 10:00", "CET")
+    """
+    if not dt_str:
+        return ("", "")
+
+    for fmt in ["%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S"]:
+        try:
+            dt = datetime.strptime(dt_str.replace("+00:00", "+0000"), fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            local_dt = dt.astimezone(LOCAL_TZ)
+            return (local_dt.strftime("%Y-%m-%d %H:%M"), get_timezone_abbrev(local_dt))
+        except ValueError:
+            continue
+
+    return (dt_str, "")
+
+
+def now_iso() -> str:
+    """Get current time in ISO format with timezone."""
+    return datetime.now(LOCAL_TZ).isoformat()
+
+
+# ============================================================================
+# gog CLI Wrapper
+# ============================================================================
+
+def run_gog(client: str, *args: str, check: bool = True) -> dict | list | None:
+    """
+    Run gog command and return parsed JSON output.
+
+    Always uses --json flag for structured output.
+    """
+    cmd = ["gog", "--client", client, "--json", *args]
+    click.echo(f"[gog] {' '.join(cmd)}", err=True)
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        if check:
+            click.echo(f"[gog] ERROR: {result.stderr}", err=True)
+            sys.exit(1)
+        return None
+
+    if not result.stdout.strip():
+        return None
+
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        click.echo(f"[gog] JSON parse error: {e}", err=True)
+        click.echo(f"[gog] stdout: {result.stdout[:500]}", err=True)
+        if check:
+            sys.exit(1)
+        return None
+
+
+def run_gog_search(client: str, query: str, max_results: int, check: bool = True) -> dict | list | None:
+    """
+    Run gog gmail search with proper query handling.
+
+    Uses shell=True with shlex.quote for complex queries with spaces.
+    """
+    escaped_query = shlex.quote(query)
+    cmd = f'gog --client {client} --json gmail search {escaped_query} --max {max_results}'
+    click.echo(f"[gog] {cmd}", err=True)
+
+    result = subprocess.run(cmd, capture_output=True, text=True, shell=True)
+
+    if result.returncode != 0:
+        if check:
+            click.echo(f"[gog] ERROR: {result.stderr}", err=True)
+            sys.exit(1)
+        return None
+
+    if not result.stdout.strip():
+        return None
+
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        click.echo(f"[gog] JSON parse error: {e}", err=True)
+        click.echo(f"[gog] stdout: {result.stdout[:500]}", err=True)
+        if check:
+            sys.exit(1)
+        return None
+
+
+# ============================================================================
+# Cache Path Management
+# ============================================================================
+
+def get_thread_dir(client: str, group: str, topic: str) -> Path:
+    """Get cache directory for threads: cache/{client}/{group}/{topic}/"""
+    d = CACHE_DIR / client / group / topic
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def get_thread_yaml_path(client: str, group: str, topic: str, thread_id: str) -> Path:
+    """Get path for thread YAML file (authoritative)."""
+    return get_thread_dir(client, group, topic) / f"thread-{thread_id}.yaml"
+
+
+def get_thread_md_path(client: str, group: str, topic: str, thread_id: str) -> Path:
+    """Get path for thread Markdown file (derived)."""
+    return get_thread_dir(client, group, topic) / f"thread-{thread_id}.md"
+
+
+# ============================================================================
+# Message/Thread Extraction from gog Response
+# ============================================================================
+
+def extract_header(headers: list[dict], name: str) -> str | None:
+    """Extract header value from Gmail headers list."""
+    for h in headers:
+        if h.get("name", "").lower() == name.lower():
+            return h.get("value")
+    return None
+
+
+def decode_body_data(data: str) -> str:
+    """Decode base64url encoded body data from Gmail API."""
+    if not data:
+        return ""
+    try:
+        # Gmail uses base64url encoding (no padding)
+        padded = data + "=" * (4 - len(data) % 4) if len(data) % 4 else data
+        decoded = base64.urlsafe_b64decode(padded)
+        return decoded.decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def extract_body_parts(payload: dict) -> dict:
+    """
+    Extract body parts from Gmail payload structure.
+
+    Returns dict with:
+      - body_text: plain text body
+      - body_html: HTML body
+      - attachments: list of attachment metadata
+    """
+    result = {
+        "body_text": "",
+        "body_html": "",
+        "attachments": [],
+    }
+
+    def process_parts(parts: list, depth: int = 0):
+        """Recursively process MIME parts."""
+        for part in parts:
+            mime_type = part.get("mimeType", "")
+            body = part.get("body", {})
+
+            if "parts" in part:
+                process_parts(part["parts"], depth + 1)
+                continue
+
+            data = body.get("data", "")
+            if data:
+                decoded = decode_body_data(data)
+                if mime_type == "text/plain" and not result["body_text"]:
+                    result["body_text"] = decoded
+                elif mime_type == "text/html" and not result["body_html"]:
+                    result["body_html"] = decoded
+
+            filename = part.get("filename", "")
+            attachment_id = body.get("attachmentId", "")
+            if filename and attachment_id:
+                result["attachments"].append({
+                    "filename": filename,
+                    "mime_type": mime_type,
+                    "size": body.get("size", 0),
+                    "attachment_id": attachment_id,
+                })
+
+    if "parts" in payload:
+        process_parts(payload["parts"])
+    else:
+        body = payload.get("body", {})
+        data = body.get("data", "")
+        mime_type = payload.get("mimeType", "")
+        if data:
+            decoded = decode_body_data(data)
+            if "html" in mime_type:
+                result["body_html"] = decoded
+            else:
+                result["body_text"] = decoded
+
+    return result
+
+
+def parse_message(msg: dict, client: str) -> dict:
+    """Parse gog message response into structured schema with full body extraction."""
+    payload = msg.get("payload", {})
+    headers_list = payload.get("headers", [])
+    top_headers = msg.get("headers", {})
+
+    def get_header(name: str) -> str | None:
+        return extract_header(headers_list, name) or top_headers.get(name)
+
+    date_str = msg.get("date") or get_header("Date") or ""
+    date_formatted, tz_abbrev = format_datetime_with_tz(date_str)
+
+    body_parts = extract_body_parts(payload)
+
+    body_markdown = ""
+    if body_parts["body_html"]:
+        body_markdown = html_to_markdown(body_parts["body_html"])
+
+    parsed = {
+        "id": msg.get("id"),
+        "rfc2822_message_id": get_header("Message-ID") or get_header("Message-Id"),
+        "date": date_str,
+        "date_formatted": date_formatted,
+        "timezone": tz_abbrev,
+        "from": msg.get("from") or get_header("From"),
+        "to": [],
+        "cc": [],
+        "bcc": [],
+        "subject": msg.get("subject") or get_header("Subject"),
+        "snippet": msg.get("snippet", ""),
+        "body": body_parts["body_text"] or msg.get("body", ""),
+        "body_text": body_parts["body_text"],
+        "body_html": body_parts["body_html"],
+        "body_markdown": body_markdown,
+        "attachments": body_parts["attachments"],
+        "headers": {
+            "In-Reply-To": get_header("In-Reply-To"),
+            "References": get_header("References"),
+            "Content-Type": get_header("Content-Type"),
+        },
+        "size_estimate": msg.get("sizeEstimate"),
+        "internal_date": msg.get("internalDate"),
+        "label_ids": msg.get("labelIds", []),
+    }
+
+    for field in ["to", "cc", "bcc"]:
+        value = msg.get(field) or get_header(field.capitalize())
+        if value:
+            if isinstance(value, list):
+                parsed[field] = value
+            else:
+                parsed[field] = [addr.strip() for addr in value.split(",")]
+
+    return parsed
+
+
+def parse_thread(thread_data: dict, client: str, group: str, topic: str, criteria_source: str) -> dict:
+    """Parse gog thread response into structured schema."""
+    messages = thread_data.get("messages", [])
+    parsed_messages = [parse_message(msg, client) for msg in messages]
+
+    parsed_messages.sort(key=lambda m: m.get("date", ""))
+
+    participants = set()
+    for msg in parsed_messages:
+        if msg.get("from"):
+            participants.add(msg["from"])
+        for addr in msg.get("to", []):
+            participants.add(addr)
+        for addr in msg.get("cc", []):
+            participants.add(addr)
+
+    first_date = parsed_messages[0].get("date", "") if parsed_messages else ""
+    last_date = parsed_messages[-1].get("date", "") if parsed_messages else ""
+    subject = parsed_messages[0].get("subject", "") if parsed_messages else ""
+
+    return {
+        "thread_id": thread_data.get("id"),
+        "subject": subject,
+        "participants": sorted(list(participants)),
+        "message_count": len(parsed_messages),
+        "first_date": first_date,
+        "last_date": last_date,
+        "labels": thread_data.get("labels", []),
+        "client": client,
+        "group": group,
+        "topic": topic,
+        "criteria_source": criteria_source,
+        "fetched_at": now_iso(),
+        "messages": parsed_messages,
+    }
+
+
+# ============================================================================
+# HTML to Markdown Conversion
+# ============================================================================
+
+def html_to_markdown(html: str) -> str:
+    """
+    Convert HTML to Markdown with proper link formatting.
+
+    Preserves [text](url) link format for better readability.
+    Falls back to plain text if HTML is empty or conversion fails.
+    """
+    if not html:
+        return ""
+
+    try:
+        # Pre-process: remove style and script tags with their content
+        clean_html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
+        clean_html = re.sub(r'<script[^>]*>.*?</script>', '', clean_html, flags=re.DOTALL | re.IGNORECASE)
+
+        # Remove HTML comments
+        clean_html = re.sub(r'<!--.*?-->', '', clean_html, flags=re.DOTALL)
+
+        # Remove head section entirely
+        clean_html = re.sub(r'<head[^>]*>.*?</head>', '', clean_html, flags=re.DOTALL | re.IGNORECASE)
+
+        # Remove table structure but keep content (email layout tables)
+        clean_html = re.sub(r'<t[dh][^>]*>', '<div>', clean_html, flags=re.IGNORECASE)
+        clean_html = re.sub(r'</t[dh]>', '</div>', clean_html, flags=re.IGNORECASE)
+        clean_html = re.sub(r'</?table[^>]*>', '', clean_html, flags=re.IGNORECASE)
+        clean_html = re.sub(r'</?tr[^>]*>', '', clean_html, flags=re.IGNORECASE)
+        clean_html = re.sub(r'</?thead[^>]*>', '', clean_html, flags=re.IGNORECASE)
+        clean_html = re.sub(r'</?tbody[^>]*>', '', clean_html, flags=re.IGNORECASE)
+
+        # Remove img tags (tracking pixels and layout images)
+        clean_html = re.sub(r'<img[^>]*>', '', clean_html, flags=re.IGNORECASE)
+
+        md = markdownify.markdownify(
+            clean_html,
+            heading_style="ATX",
+            bullets="*",
+        )
+
+        # Clean up excessive whitespace
+        md = re.sub(r'\n{3,}', '\n\n', md)
+        md = '\n'.join(line.rstrip() for line in md.splitlines())
+
+        # Remove lines that are just whitespace, special chars, or pipe-only (table remnants)
+        lines = []
+        for line in md.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if re.match(r'^[\s\u00a0\u200b\u200c\u200d\ufeff]+$', stripped):
+                continue
+            if re.match(r'^[\|\-\s]+$', stripped):
+                continue
+            if re.match(r'^[\u034f\u200b-\u200f\u2028-\u202f\u205f-\u206f]+$', stripped):
+                continue
+            lines.append(line)
+        md = '\n'.join(lines)
+
+        md = re.sub(r'\n{3,}', '\n\n', md)
+
+        return md.strip()
+    except Exception:
+        return ""
+
+
+def get_message_body_for_markdown(msg: dict) -> str:
+    """
+    Get the best body representation for Markdown output.
+
+    Priority: body_markdown > HTML converted > plain text
+    """
+    body_markdown = msg.get("body_markdown", "")
+    if body_markdown:
+        return body_markdown
+
+    body_html = msg.get("body_html", "")
+    if body_html:
+        converted = html_to_markdown(body_html)
+        if converted:
+            return converted
+
+    return msg.get("body", "") or msg.get("body_text", "")
+
+
+# ============================================================================
+# File Generation
+# ============================================================================
+
+def generate_thread_yaml(thread: dict) -> str:
+    """Generate YAML content for thread (authoritative format)."""
+    return yaml_dumps(thread)
+
+
+def to_plain_python(obj):
+    """Convert ruamel.yaml types to plain Python types."""
+    if hasattr(obj, 'items'):
+        return {k: to_plain_python(v) for k, v in obj.items()}
+    elif hasattr(obj, '__iter__') and not isinstance(obj, (str, bytes)):
+        return [to_plain_python(i) for i in obj]
+    else:
+        return obj
+
+
+def generate_thread_markdown(thread: dict) -> str:
+    """Generate Markdown content for thread (derived, human-readable)."""
+    fm = {
+        "thread_id": str(thread["thread_id"]),
+        "subject": str(thread["subject"]) if thread.get("subject") else "",
+        "participants": list(thread.get("participants", [])),
+        "message_count": int(thread.get("message_count", 0)),
+        "first_date": str(thread.get("first_date", "")),
+        "last_date": str(thread.get("last_date", "")),
+        "client": str(thread.get("client", "")),
+        "source_yaml": f"thread-{thread['thread_id']}.yaml",
+    }
+
+    sections = []
+    for i, msg in enumerate(thread.get("messages", []), 1):
+        date_fmt = msg.get("date_formatted", msg.get("date", ""))
+        tz = msg.get("timezone", "")
+        date_display = f"{date_fmt} {tz}".strip()
+
+        lines = [f"## Message {i} - {date_display}"]
+        lines.append(f"**From:** {msg.get('from', 'N/A')}")
+
+        if msg.get("to"):
+            lines.append(f"**To:** {', '.join(msg['to'])}")
+        if msg.get("cc"):
+            lines.append(f"**Cc:** {', '.join(msg['cc'])}")
+        if msg.get("bcc"):
+            lines.append(f"**Bcc:** {', '.join(msg['bcc'])}")
+
+        lines.append("")
+        lines.append(get_message_body_for_markdown(msg))
+
+        sections.append("\n".join(lines))
+
+    body = "\n\n---\n\n".join(sections)
+
+    post = frontmatter.Post(body, **fm)
+    return frontmatter.dumps(post)
+
+
+def content_changed(existing_path: Path, new_content: str) -> bool:
+    """
+    Check if content meaningfully changed (ignoring fetched_at).
+
+    Returns True if file should be updated, False if identical.
+    """
+    if not existing_path.exists():
+        return True
+
+    def strip_fetched_at(content: str) -> str:
+        return "\n".join(
+            line for line in content.splitlines()
+            if not line.strip().startswith("fetched_at:")
+        )
+
+    existing = strip_fetched_at(existing_path.read_text())
+    new = strip_fetched_at(new_content)
+
+    return existing != new
+
+
+def write_thread_files(thread: dict, client: str, group: str, topic: str) -> tuple[Path, Path, bool]:
+    """
+    Write thread YAML and Markdown files.
+
+    Returns (yaml_path, md_path, was_updated).
+    Only writes if content meaningfully changed.
+    """
+    thread_id = thread["thread_id"]
+    yaml_path = get_thread_yaml_path(client, group, topic, thread_id)
+    md_path = get_thread_md_path(client, group, topic, thread_id)
+
+    yaml_content = generate_thread_yaml(thread)
+    md_content = generate_thread_markdown(thread)
+
+    yaml_changed = content_changed(yaml_path, yaml_content)
+    md_missing = not md_path.exists()
+
+    if not yaml_changed and not md_missing:
+        return yaml_path, md_path, False
+
+    if yaml_changed:
+        yaml_path.write_text(yaml_content)
+    md_path.write_text(md_content)
+
+    return yaml_path, md_path, True
+
+
+# ============================================================================
+# Criteria Management
+# ============================================================================
+
+def load_global_exclusions() -> dict:
+    """Load global exclusions from _global.yaml."""
+    global_path = CRITERIA_DIR / "_global.yaml"
+    if not global_path.exists():
+        return {"exclude": {"addresses": [], "domains": [], "subjects": []}}
+    return yaml_load(global_path)
+
+
+def load_criteria(name: str) -> dict:
+    """Load criteria from YAML file, merging with global exclusions."""
+    criteria_path = CRITERIA_DIR / f"{name}.yaml"
+    if not criteria_path.exists():
+        raise click.ClickException(f"Criteria not found: {criteria_path}")
+
+    criteria = yaml_load(criteria_path)
+
+    if criteria.get("skip_global_exclusions", False):
+        return criteria
+
+    global_exc = load_global_exclusions()
+    if "exclude" not in criteria:
+        criteria["exclude"] = {}
+
+    for key in ["addresses", "domains", "subjects"]:
+        global_list = global_exc.get("exclude", {}).get(key, [])
+        local_list = criteria.get("exclude", {}).get(key, [])
+        criteria["exclude"][key] = list(set(global_list + local_list))
+
+    return criteria
+
+
+def list_criteria() -> list[str]:
+    """List available criteria names (excluding _global)."""
+    if not CRITERIA_DIR.exists():
+        return []
+    return [p.stem for p in CRITERIA_DIR.glob("*.yaml") if p.stem != "_global"]
+
+
+def build_gmail_query(criteria: dict) -> str:
+    """Build Gmail search query from criteria."""
+    parts = []
+
+    include = criteria.get("include", {})
+    exclude = criteria.get("exclude", {})
+
+    include_parts = []
+
+    for addr in include.get("addresses", []):
+        include_parts.append(f"from:{addr}")
+
+    for domain in include.get("domains", []):
+        include_parts.append(f"from:{domain}")
+
+    for subj in include.get("subjects", []):
+        include_parts.append(f"subject:{subj}")
+
+    if include_parts:
+        parts.append(f"({' OR '.join(include_parts)})")
+
+    for addr in exclude.get("addresses", []):
+        parts.append(f"-from:{addr}")
+
+    for domain in exclude.get("domains", []):
+        parts.append(f"-from:{domain}")
+
+    for subj in exclude.get("subjects", []):
+        parts.append(f"-subject:{subj}")
+
+    newer_than = criteria.get("newer_than", "90d")
+    parts.append(f"newer_than:{newer_than}")
+
+    return " ".join(parts)
+
+
+# ============================================================================
+# Sync Operations
+# ============================================================================
+
+# IMPORTANT: Thread Mutability Assumptions
+# =========================================
+# Gmail threads are NOT immutable. Messages can appear at any time:
+#
+# 1. New replies added to thread (common)
+# 2. Older messages appearing later due to:
+#    - Delayed delivery (network issues, spam filtering)
+#    - Re-classification (moved from spam/trash)
+#    - Server-side backfill or sync delays
+#    - Import/migration operations
+#
+# Current behavior (v0.1.x):
+#   - Fetches full thread content every sync (inefficient)
+#   - Compares content to detect changes before writing
+#   - Does NOT skip API calls for cached threads
+#
+# TODO (future optimization - see FUTURE_WORK.md P110):
+#   - Fetch thread metadata first (message ID list only)
+#   - Compare with cached message IDs
+#   - Only fetch --full for NEW messages not in cache
+
+
+def sync_criteria(criteria_name: str, dry_run: bool = False, verbose: int = 0) -> dict:
+    """
+    Sync threads matching criteria.
+
+    Returns summary dict with counts.
+
+    Verbosity levels:
+      0: Basic output (default)
+      1: Show cache status per thread
+      2: Show message counts and IDs
+      3: Show content comparison details
+      4: Show full API responses (truncated)
+    """
+    criteria = load_criteria(criteria_name)
+    clients = criteria.get("clients", ["default"])
+    group = criteria.get("group", criteria_name.rsplit("-", 1)[0])
+    topic = criteria.get("topic", "default")
+    max_results = criteria.get("max_results", 100)
+
+    query = build_gmail_query(criteria)
+    click.echo(f"Criteria: {criteria_name}")
+    click.echo(f"Group: {group}, Topic: {topic}")
+    click.echo(f"Clients: {', '.join(clients)}")
+    click.echo(f"Query: {query}")
+    click.echo(f"Max results: {max_results}")
+    if verbose:
+        click.echo(f"Verbosity: {verbose}")
+
+    if dry_run:
+        click.echo("\n[DRY RUN] Would search and sync matching threads")
+        return {"dry_run": True}
+
+    summary = {
+        "criteria": criteria_name,
+        "clients": {},
+        "total_threads": 0,
+        "total_new": 0,
+        "total_updated": 0,
+        "total_unchanged": 0,
+    }
+
+    for client in clients:
+        click.echo(f"\n--- Syncing client: {client} ---")
+
+        results = run_gog_search(client, query, max_results, check=False)
+
+        if not results:
+            click.echo(f"  No results for {client}")
+            summary["clients"][client] = {"threads": 0, "new": 0, "updated": 0}
+            continue
+
+        if isinstance(results, list):
+            threads = results
+        elif isinstance(results, dict):
+            threads = results.get("threads", []) or []
+        else:
+            threads = []
+
+        if not threads:
+            click.echo(f"  No results for {client}")
+            summary["clients"][client] = {"threads": 0, "new": 0, "updated": 0, "unchanged": 0}
+            continue
+
+        click.echo(f"  Found {len(threads)} threads")
+
+        client_summary = {"threads": len(threads), "new": 0, "updated": 0, "unchanged": 0}
+
+        for thread_info in threads:
+            thread_id = thread_info.get("id") if isinstance(thread_info, dict) else thread_info
+            if not thread_id:
+                continue
+
+            yaml_path = get_thread_yaml_path(client, group, topic, thread_id)
+            md_path = get_thread_md_path(client, group, topic, thread_id)
+            is_new = not yaml_path.exists()
+
+            if verbose >= 1:
+                cache_status = "NEW" if is_new else "CACHED"
+                click.echo(f"    [{cache_status}] {thread_id}")
+                click.echo(f"      yaml: {yaml_path}")
+                if verbose >= 2:
+                    click.echo(f"      md:   {md_path}")
+                    click.echo(f"      md_exists: {md_path.exists()}")
+
+            cached_msg_ids = set()
+            if not is_new and verbose >= 2:
+                try:
+                    cached_data = yaml_load(yaml_path)
+                    cached_msg_ids = {m.get("id") for m in cached_data.get("messages", [])}
+                    click.echo(f"      cached_messages: {len(cached_msg_ids)}")
+                    if verbose >= 3:
+                        for mid in sorted(cached_msg_ids):
+                            click.echo(f"        - {mid}")
+                except Exception as e:
+                    click.echo(f"      [warn] Failed to read cache: {e}", err=True)
+
+            if verbose >= 1:
+                click.echo(f"      fetching: gog gmail thread get {thread_id} --full")
+
+            thread_response = run_gog(client, "gmail", "thread", "get", thread_id, "--full", check=False)
+            if not thread_response:
+                click.echo(f"    [error] {thread_id[:12]} - fetch failed", err=True)
+                continue
+
+            if verbose >= 4:
+                response_str = json.dumps(thread_response, indent=2)
+                if len(response_str) > 2000:
+                    click.echo(f"      response (truncated): {response_str[:2000]}...")
+                else:
+                    click.echo(f"      response: {response_str}")
+
+            thread_data = thread_response.get("thread", thread_response)
+
+            if verbose >= 2:
+                fetched_msgs = thread_data.get("messages", [])
+                fetched_msg_ids = {m.get("id") for m in fetched_msgs}
+                click.echo(f"      fetched_messages: {len(fetched_msg_ids)}")
+                new_msg_ids = fetched_msg_ids - cached_msg_ids
+                if new_msg_ids:
+                    click.echo(f"      NEW messages: {len(new_msg_ids)}")
+                    if verbose >= 3:
+                        for mid in sorted(new_msg_ids):
+                            click.echo(f"        + {mid}")
+
+            parsed = parse_thread(thread_data, client, group, topic, criteria_name)
+            yaml_path, md_path, was_updated = write_thread_files(parsed, client, group, topic)
+
+            if is_new:
+                click.echo(f"    [new] {thread_id[:12]} - {parsed.get('subject', '')[:40]}")
+                client_summary["new"] += 1
+            elif was_updated:
+                click.echo(f"    [updated] {thread_id[:12]} - {parsed.get('subject', '')[:40]}")
+                client_summary["updated"] += 1
+            else:
+                click.echo(f"    [unchanged] {thread_id[:12]}")
+                client_summary["unchanged"] += 1
+
+        summary["clients"][client] = client_summary
+        summary["total_threads"] += client_summary["threads"]
+        summary["total_new"] += client_summary["new"]
+        summary["total_updated"] += client_summary["updated"]
+        summary["total_unchanged"] += client_summary["unchanged"]
+
+    return summary
+
+
+# ============================================================================
+# CLI Commands
+# ============================================================================
+
+@click.group()
+@click.version_option(version="0.1.0")
+def cli():
+    """gog-ng - Enhanced gog CLI Wrapper
+
+    Wraps `gog` CLI to provide local caching, criteria-based search,
+    and structured output for Gmail threads.
+
+    Cache format: YAML (authoritative) + Markdown (derived).
+    """
+    pass
+
+
+@cli.command()
+@click.option("--criteria", "criteria_name", required=True, help="Criteria file name (without .yaml)")
+@click.option("--dry-run", is_flag=True, help="Show what would be synced without fetching")
+@click.option("-v", "--verbose", count=True, help="Increase verbosity (-v, -vv, -vvv, -vvvv)")
+def sync(criteria_name: str, dry_run: bool, verbose: int):
+    """Sync threads matching criteria to local cache."""
+    summary = sync_criteria(criteria_name, dry_run, verbose)
+
+    if not dry_run:
+        click.echo(f"\n=== Sync Summary ===")
+        click.echo(f"Total threads: {summary['total_threads']}")
+        click.echo(f"  New: {summary['total_new']}")
+        click.echo(f"  Updated: {summary['total_updated']}")
+        click.echo(f"  Unchanged: {summary['total_unchanged']}")
+
+
+@cli.command()
+@click.option("--client", required=True, help="OAuth client name")
+@click.argument("thread_id")
+@click.option("--group", required=True, help="Group name for cache path")
+@click.option("--topic", default="default", help="Topic name for cache path")
+@click.option("--force", is_flag=True, help="Bypass cache, fetch fresh")
+@click.option("--format", "output_format", type=click.Choice(["yaml", "md", "both"]), default="yaml")
+def thread(client: str, thread_id: str, group: str, topic: str, force: bool, output_format: str):
+    """Fetch and cache a specific thread."""
+    yaml_path = get_thread_yaml_path(client, group, topic, thread_id)
+    md_path = get_thread_md_path(client, group, topic, thread_id)
+
+    if not force and yaml_path.exists():
+        if not md_path.exists() and output_format in ["md", "both"]:
+            click.echo(f"[regenerating md] {md_path}", err=True)
+            thread_data = yaml_load(yaml_path)
+            md_content = generate_thread_markdown(thread_data)
+            md_path.write_text(md_content)
+
+        click.echo(f"[cached] {yaml_path}", err=True)
+        if output_format in ["yaml", "both"]:
+            click.echo(yaml_path.read_text())
+        if output_format in ["md", "both"]:
+            click.echo(md_path.read_text())
+        return
+
+    thread_response = run_gog(client, "gmail", "thread", "get", thread_id, "--full")
+    if not thread_response:
+        raise click.ClickException(f"Failed to fetch thread {thread_id}")
+
+    thread_data = thread_response.get("thread", thread_response)
+
+    parsed = parse_thread(thread_data, client, group, topic, f"manual-{group}-{topic}")
+    yaml_path, md_path, _ = write_thread_files(parsed, client, group, topic)
+
+    click.echo(f"[fetched] {yaml_path}", err=True)
+
+    if output_format in ["yaml", "both"]:
+        click.echo(yaml_path.read_text())
+    if output_format in ["md", "both"]:
+        click.echo(md_path.read_text())
+
+
+@cli.command("list")
+@click.option("--client", help="Filter by client")
+@click.option("--group", help="Filter by group")
+@click.option("--topic", help="Filter by topic")
+@click.option("--format", "output_format", type=click.Choice(["table", "yaml", "json"]), default="table")
+def list_cmd(client: str | None, group: str | None, topic: str | None, output_format: str):
+    """List cached threads."""
+    pattern = "thread-*.yaml"
+
+    if client and group and topic:
+        search_path = CACHE_DIR / client / group / topic
+    elif client and group:
+        search_path = CACHE_DIR / client / group
+    elif client:
+        search_path = CACHE_DIR / client
+    else:
+        search_path = CACHE_DIR
+
+    yaml_files = list(search_path.rglob(pattern)) if search_path.exists() else []
+
+    if not yaml_files:
+        click.echo("No cached threads found.")
+        return
+
+    threads = []
+    for yf in sorted(yaml_files):
+        data = yaml_load(yf)
+        threads.append({
+            "thread_id": data.get("thread_id", ""),
+            "subject": data.get("subject", "")[:50],
+            "client": data.get("client", ""),
+            "group": data.get("group", ""),
+            "topic": data.get("topic", ""),
+            "messages": data.get("message_count", 0),
+            "last_date": data.get("last_date", ""),
+        })
+
+    if output_format == "json":
+        click.echo(json.dumps(threads, indent=2))
+    elif output_format == "yaml":
+        click.echo(yaml_dumps(threads))
+    else:
+        click.echo(f"{'Thread ID':<14} {'Client':<10} {'Group':<25} {'Msgs':<5} Subject")
+        click.echo("-" * 90)
+        for t in threads:
+            click.echo(f"{t['thread_id'][:12]:<14} {t['client']:<10} {t['group'][:23]:<25} {t['messages']:<5} {t['subject']}")
+
+
+@cli.command("criteria")
+@click.option("--list", "list_all", is_flag=True, help="List available criteria")
+@click.argument("name", required=False)
+def criteria_cmd(list_all: bool, name: str | None):
+    """Manage search criteria."""
+    if list_all or not name:
+        names = list_criteria()
+        if not names:
+            click.echo("No criteria defined. Create files in criteria/*.yaml")
+            return
+        click.echo("Available criteria:")
+        for n in names:
+            crit = load_criteria(n)
+            desc = crit.get("description", "")[:50]
+            clients = ", ".join(crit.get("clients", []))
+            click.echo(f"  - {n}")
+            click.echo(f"      Clients: {clients}")
+            click.echo(f"      {desc}")
+        return
+
+    criteria = load_criteria(name)
+    click.echo(yaml_dumps(criteria))
+    click.echo(f"\n--- Generated Query ---")
+    click.echo(build_gmail_query(criteria))
+
+
+@cli.command("labels")
+@click.option("--client", required=True, help="OAuth client name")
+def labels(client: str):
+    """List Gmail labels."""
+    result = run_gog(client, "gmail", "labels", "list")
+    if result:
+        click.echo(yaml_dumps(result))
+
+
+@cli.command("rebuild-db")
+def rebuild_db():
+    """Rebuild SQLite index from cached YAML files."""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite_utils.Database(DB_PATH)
+
+    if "threads" in db.table_names():
+        db["threads"].drop()
+    if "messages" in db.table_names():
+        db["messages"].drop()
+
+    db["threads"].create({
+        "thread_id": str,
+        "client": str,
+        "group_name": str,
+        "topic": str,
+        "subject": str,
+        "participants": str,
+        "message_count": int,
+        "first_date": str,
+        "last_date": str,
+        "labels": str,
+        "fetched_at": str,
+        "cache_path": str,
+    }, pk="thread_id")
+
+    db["messages"].create({
+        "id": str,
+        "thread_id": str,
+        "client": str,
+        "rfc2822_message_id": str,
+        "date": str,
+        "from_addr": str,
+        "to_addrs": str,
+        "cc_addrs": str,
+        "subject": str,
+        "body": str,
+    }, pk="id")
+
+    total_threads = 0
+    total_messages = 0
+
+    for yaml_path in CACHE_DIR.rglob("thread-*.yaml"):
+        data = yaml_load(yaml_path)
+
+        db["threads"].insert({
+            "thread_id": data.get("thread_id"),
+            "client": data.get("client"),
+            "group_name": data.get("group"),
+            "topic": data.get("topic"),
+            "subject": data.get("subject"),
+            "participants": json.dumps(data.get("participants", [])),
+            "message_count": data.get("message_count", 0),
+            "first_date": data.get("first_date"),
+            "last_date": data.get("last_date"),
+            "labels": json.dumps(data.get("labels", [])),
+            "fetched_at": data.get("fetched_at"),
+            "cache_path": str(yaml_path),
+        }, replace=True)
+        total_threads += 1
+
+        for msg in data.get("messages", []):
+            db["messages"].insert({
+                "id": msg.get("id"),
+                "thread_id": data.get("thread_id"),
+                "client": data.get("client"),
+                "rfc2822_message_id": msg.get("rfc2822_message_id"),
+                "date": msg.get("date"),
+                "from_addr": msg.get("from"),
+                "to_addrs": json.dumps(msg.get("to", [])),
+                "cc_addrs": json.dumps(msg.get("cc", [])),
+                "subject": msg.get("subject"),
+                "body": msg.get("body"),
+            }, replace=True)
+            total_messages += 1
+
+    click.echo(f"Indexed {total_threads} threads, {total_messages} messages to {DB_PATH}")
+
+
+@cli.command()
+@click.argument("sql")
+@click.option("--format", "output_format", type=click.Choice(["table", "json", "csv"]), default="table")
+def query(sql: str, output_format: str):
+    """Query SQLite database directly."""
+    if not DB_PATH.exists():
+        raise click.ClickException(f"Database not found: {DB_PATH}. Run 'rebuild-db' first.")
+
+    db = sqlite_utils.Database(DB_PATH)
+
+    try:
+        cursor = db.execute(sql)
+        rows = cursor.fetchall()
+        columns = [d[0] for d in cursor.description] if rows else []
+    except Exception as e:
+        raise click.ClickException(f"SQL error: {e}")
+
+    if not rows:
+        click.echo("No results.")
+        return
+
+    if output_format == "json":
+        results = [dict(zip(columns, row)) for row in rows]
+        click.echo(json.dumps(results, indent=2))
+    elif output_format == "csv":
+        click.echo(",".join(columns))
+        for row in rows:
+            click.echo(",".join(str(v) if v is not None else "" for v in row))
+    else:
+        col_widths = [max(len(str(c)), max((len(str(row[i])) for row in rows), default=0)) for i, c in enumerate(columns)]
+        col_widths = [min(w, 50) for w in col_widths]
+        header = " | ".join(str(c)[:w].ljust(w) for c, w in zip(columns, col_widths))
+        click.echo(header)
+        click.echo("-" * len(header))
+        for row in rows:
+            click.echo(" | ".join(str(v)[:w].ljust(w) if v is not None else "".ljust(w) for v, w in zip(row, col_widths)))
+
+
+if __name__ == "__main__":
+    cli()

@@ -1,0 +1,18 @@
+description: "Global exclusions applied to all criteria"
+
+exclude:
+  addresses:
+    - "noreply@"
+    - "no-reply@"
+    - "mailer-daemon@"
+    - "notifications@"
+  domains:
+    - "@mailchimp.com"
+    - "@sendgrid.net"
+    - "@mailgun.net"
+    - "@amazonses.com"
+  subjects:
+    - "unsubscribe"
+    - "newsletter"
+    - "promotional"
+    - "weekly digest"

@@ -1,0 +1,23 @@
+# Email cache data
+cache/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# SQLite databases
+*.sqlite3
+
+# Claude Code backups
+.claude/*.bak.*
+
+# Temporary files
+tmp/
+
+# OS files
+.DS_Store
+Thumbs.db
