@@ -269,7 +269,7 @@ yq 'select(.participants[] | contains("alice"))' cache/default/*/default/*.yaml
 | `GOG_NG_CACHE_DIR` | `./cache` | Cache directory |
 | `GOG_NG_DB_PATH` | `/tmp/gog-ng/index.sqlite3` | SQLite path |
 | `GOG_NG_CRITERIA_DIR` | `./criteria` | Criteria files |
-| `GOG_NG_TIMEZONE` | `UTC` | Display timezone (e.g., `Europe/Warsaw`, `US/Eastern`) |
+| `GOG_NG_TIMEZONE` | `UTC` | Display timezone (e.g., `Europe/Zurich`, `US/Eastern`, `Asia/Tokyo`) |
 
 ## Limitations
 
