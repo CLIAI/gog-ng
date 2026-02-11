@@ -54,35 +54,71 @@ Gmail API
 * **SQLite is ephemeral** - rebuilt from YAML anytime
 * **Git tracks everything** - enables diff-based verification
 
+## Installation
+
+### Prerequisites
+
+* Python 3.11+
+* `gog` CLI installed and authenticated (see [steipete/gogcli](https://github.com/steipete/gogcli))
+* `uv` installed (for PEP 723 script execution) - `pip install uv` or see [astral-sh/uv](https://github.com/astral-sh/uv)
+
+### Install gog-ng
+
+**Option 1: Symlink to PATH (recommended)**
+
+```bash
+# Clone the repository
+git clone https://github.com/CLIAI/gog-ng ~/gog-ng
+
+# Create symlink in ~/.local/bin (or /usr/local/bin for system-wide)
+ln -s ~/gog-ng/gog-ng ~/.local/bin/gog-ng
+
+# Verify
+gog-ng --version
+```
+
+**Option 2: Copy to PATH**
+
+```bash
+cp ~/gog-ng/gog-ng ~/.local/bin/gog-ng
+chmod +x ~/.local/bin/gog-ng
+gog-ng --version
+```
+
+**Option 3: Run directly**
+
+```bash
+git clone https://github.com/CLIAI/gog-ng
+cd gog-ng
+./gog-ng --version
+```
+
 ## Quick Start
 
 ```bash
-# Make sure gog CLI is installed and authenticated
-# See: https://github.com/steipete/gogcli
-
 # List available criteria
-./gog-ng criteria --list
+gog-ng criteria --list
 
 # Preview what would be synced (dry run)
-./gog-ng sync --criteria example-project --dry-run
+gog-ng sync --criteria example-project --dry-run
 
 # Sync threads matching criteria
-./gog-ng sync --criteria example-project
+gog-ng sync --criteria example-project
 
 # Sync with verbose output (debugging)
-./gog-ng sync --criteria example-project -v     # Cache status
-./gog-ng sync --criteria example-project -vv    # + message counts
-./gog-ng sync --criteria example-project -vvv   # + message IDs
-./gog-ng sync --criteria example-project -vvvv  # + API responses
+gog-ng sync --criteria example-project -v     # Cache status
+gog-ng sync --criteria example-project -vv    # + message counts
+gog-ng sync --criteria example-project -vvv   # + message IDs
+gog-ng sync --criteria example-project -vvvv  # + API responses
 
 # List cached threads
-./gog-ng list --client default
+gog-ng list --client default
 
 # Rebuild SQLite index for queries
-./gog-ng rebuild-db
+gog-ng rebuild-db
 
 # Query cached data
-./gog-ng query "SELECT subject, from_addr FROM messages WHERE date > '2025-01'"
+gog-ng query "SELECT subject, from_addr FROM messages WHERE date > '2025-01'"
 ```
 
 ## Cache Structure
