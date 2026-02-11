@@ -165,6 +165,20 @@ max_results: 100
 
 Global exclusions in `criteria/_global.yaml` are automatically merged (newsletters, noreply addresses, etc.).
 
+## Claude Skills (AI Assistant Workflows)
+
+gog-ng includes specialized Claude Code skills for common workflows:
+
+| Skill | Invocation | Purpose |
+|-------|------------|---------|
+| **sync-verify** | `/sync-verify [criteria]` | Daily sync + verification workflow |
+| **debug-sync** | `/debug-sync [criteria\|thread-id]` | Structured debugging for sync failures |
+| **new-criteria** | `/new-criteria [name]` | Guided creation of new search criteria |
+| **query-cache** | `/query-cache [search-term\|SQL]` | Search and analyze cached emails |
+| **gog-ng-dev** | `/gog-ng-dev` | Development reference and checklist |
+
+Skills are located in `.claude/skills/` and provide automated workflows for common tasks when using Claude Code CLI.
+
 ## Commands Reference
 
 ### sync

@@ -30,3 +30,13 @@ For what to look where, keep handy index, what should be searched were and how i
 `gog-ng` is an extensionless executable (uv shebang) wrapping the `gog` CLI.
 It provides cached Gmail access with criteria-based search.
 Read-only by default. YAML files are authoritative, Markdown is derived.
+
+## Claude skills available
+
+Specialized workflows in `.claude/skills/`:
+
+* `/sync-verify [criteria]` - Daily sync + verification
+* `/debug-sync [criteria|thread-id]` - Debug sync failures
+* `/new-criteria [name]` - Create new search criteria
+* `/query-cache [term|SQL]` - Search cached emails
+* `/gog-ng-dev` - Development reference
