@@ -262,7 +262,9 @@ yq '[.messages[] | {date: .date, subject: .subject}]' cache/default/*/default/*.
 yq 'select(.participants[] | contains("alice"))' cache/default/*/default/*.yaml
 ```
 
-## Environment Variables
+## Configuration
+
+### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -270,6 +272,20 @@ yq 'select(.participants[] | contains("alice"))' cache/default/*/default/*.yaml
 | `GOG_NG_DB_PATH` | `/tmp/gog-ng/index.sqlite3` | SQLite path |
 | `GOG_NG_CRITERIA_DIR` | `./criteria` | Criteria files |
 | `GOG_NG_TIMEZONE` | `UTC` | Display timezone (e.g., `Europe/Zurich`, `US/Eastern`, `Asia/Tokyo`) |
+
+### .env File Support
+
+gog-ng automatically loads configuration from `.env.gog-ng` or `.env` files:
+
+```bash
+# Copy the example file
+cp dotenv.gog-ng.example .env.gog-ng
+
+# Edit with your settings
+# .env.gog-ng is gitignored - safe for local configuration
+```
+
+**Priority order:** environment variables > `.env.gog-ng` > `.env` > built-in defaults
 
 ## Limitations
 

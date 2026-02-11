@@ -1,3 +1,9 @@
+# Environment configuration (local settings)
+.env
+.env.gog-ng
+.env.*
+!dotenv.gog-ng.example
+
 # Email cache data
 cache/
 

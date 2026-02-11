@@ -1,0 +1,26 @@
+# Example configuration for gog-ng
+#
+# Copy this file to .env.gog-ng (which is gitignored) and customize:
+#   cp dotenv.gog-ng.example .env.gog-ng
+#
+# gog-ng will automatically load variables from .env.gog-ng or .env
+# Priority: environment variables > .env.gog-ng > .env > built-in defaults
+
+# Cache directory for email data (YAML + Markdown files)
+# Default: ./cache
+#GOG_NG_CACHE_DIR=/path/to/custom/cache
+
+# SQLite database path for indexing
+# Default: /tmp/gog-ng/index.sqlite3
+#GOG_NG_DB_PATH=/path/to/custom/index.sqlite3
+
+# Criteria files directory
+# Default: ./criteria
+#GOG_NG_CRITERIA_DIR=/path/to/custom/criteria
+
+# Display timezone for email timestamps
+# Default: UTC
+# Examples: Europe/Zurich, US/Eastern, Asia/Tokyo, America/New_York
+GOG_NG_TIMEZONE=UTC
+
+# Note: .env.gog-ng is excluded by .gitignore - safe for local configuration

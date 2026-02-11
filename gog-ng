@@ -7,6 +7,7 @@
 #     "sqlite-utils>=3.36",
 #     "click>=8.1",
 #     "markdownify>=0.13",
+#     "python-dotenv>=1.0",
 # ]
 # ///
 """
@@ -44,6 +45,7 @@ import click
 import frontmatter
 import markdownify
 import sqlite_utils
+from dotenv import load_dotenv
 from ruamel.yaml import YAML
 
 # ============================================================================
@@ -51,6 +53,13 @@ from ruamel.yaml import YAML
 # ============================================================================
 
 SCRIPT_DIR = Path(__file__).parent
+
+# Load environment variables from .env.gog-ng or .env (if present)
+# Priority: environment variables > .env.gog-ng > .env > defaults
+for env_file in [SCRIPT_DIR / ".env.gog-ng", SCRIPT_DIR / ".env"]:
+    if env_file.exists():
+        load_dotenv(env_file)
+        break
 DEFAULT_CACHE_DIR = SCRIPT_DIR / "cache"
 DEFAULT_DB_PATH = Path("/tmp/gog-ng/index.sqlite3")
 DEFAULT_CRITERIA_DIR = SCRIPT_DIR / "criteria"
