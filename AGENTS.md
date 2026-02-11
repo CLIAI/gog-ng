@@ -11,3 +11,6 @@ For what to look where, keep handy index, what should be searched were and how i
 * https://github.com/gwwtests/google-api-datamodel-gogcli-mapping
 * https://github.com/steipete/gogcli
 
+## Project managemtn
+
+* @ai-docs/REPO_MANAGEMENT.md
